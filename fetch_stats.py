@@ -8,9 +8,10 @@ import os
 import sys
 import json
 import argparse
+import re
 from datetime import datetime
 from dotenv import load_dotenv
-from plausible_sdk import PlausibleClient, PlausibleAPIError
+from plausible_sdk import PlausibleClient, PlausibleAPIError, PlausibleRateLimitError
 
 
 def load_config():
@@ -18,33 +19,82 @@ def load_config():
     # Load .env file if it exists
     load_dotenv()
 
-    base_url = os.getenv('PLAUSIBLE_BASE_URL')
-    api_key = os.getenv('PLAUSIBLE_API_KEY')
+    base_url = os.getenv('PLAUSIBLE_BASE_URL', '').strip()
+    api_key = os.getenv('PLAUSIBLE_API_KEY', '').strip()
 
     if not base_url:
-        raise ValueError("PLAUSIBLE_BASE_URL environment variable is required")
+        raise ValueError("PLAUSIBLE_BASE_URL environment variable is required and cannot be empty")
     if not api_key:
-        raise ValueError("PLAUSIBLE_API_KEY environment variable is required")
+        raise ValueError("PLAUSIBLE_API_KEY environment variable is required and cannot be empty")
+
+    # Validate URL format
+    if not base_url.startswith(('http://', 'https://')):
+        raise ValueError("PLAUSIBLE_BASE_URL must start with http:// or https://")
 
     return {
         'base_url': base_url,
         'api_key': api_key,
-        'output_dir': os.getenv('OUTPUT_DIR', './output')
+        'output_dir': os.getenv('OUTPUT_DIR', './output').strip()
     }
 
 
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize filename to remove invalid characters
+
+    Args:
+        filename: Original filename
+
+    Returns:
+        Sanitized filename safe for filesystem use
+    """
+    # Remove or replace invalid filename characters
+    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    # Remove control characters
+    filename = re.sub(r'[\x00-\x1f\x7f]', '', filename)
+    # Limit length
+    if len(filename) > 200:
+        name, ext = os.path.splitext(filename)
+        filename = name[:195] + ext
+    return filename
+
+
 def save_to_file(data: dict, output_dir: str, filename: str = None):
-    """Save data to JSON file"""
-    os.makedirs(output_dir, exist_ok=True)
+    """
+    Save data to JSON file with error handling
+
+    Args:
+        data: Dictionary to save as JSON
+        output_dir: Directory to save the file
+        filename: Optional filename (auto-generated if not provided)
+
+    Returns:
+        Path to saved file
+
+    Raises:
+        IOError: If unable to create directory or write file
+        TypeError: If data cannot be JSON serialized
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        raise IOError(f"Failed to create output directory '{output_dir}': {str(e)}")
 
     if filename is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f'plausible_stats_{timestamp}.json'
+    else:
+        filename = sanitize_filename(filename)
 
     filepath = os.path.join(output_dir, filename)
 
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except TypeError as e:
+        raise TypeError(f"Failed to serialize data to JSON: {str(e)}")
+    except IOError as e:
+        raise IOError(f"Failed to write file '{filepath}': {str(e)}")
 
     return filepath
 
@@ -77,28 +127,46 @@ def fetch_all_sites_stats(client: PlausibleClient, period: str = 'day', save_out
         # Format each site's stats
         for domain, site_data in stats.items():
             if site_data.get('success'):
-                formatted = client.format_stats_summary(site_data['stats'])
-                summary['sites'][domain] = {
-                    'timezone': site_data.get('timezone'),
-                    'metrics': formatted['metrics']
-                }
+                try:
+                    formatted = client.format_stats_summary(site_data['stats'])
+                    summary['sites'][domain] = {
+                        'timezone': site_data.get('timezone'),
+                        'metrics': formatted.get('metrics', {})
+                    }
+                except (ValueError, KeyError) as e:
+                    summary['sites'][domain] = {
+                        'error': f"Failed to format stats: {str(e)}"
+                    }
             else:
                 summary['sites'][domain] = {
-                    'error': site_data.get('error')
+                    'error': site_data.get('error', 'Unknown error')
                 }
 
         # Output JSON
-        print(json.dumps(summary, indent=2))
+        try:
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
+        except TypeError as e:
+            print(f"Error: Failed to serialize results to JSON: {e}", file=sys.stderr)
+            sys.exit(1)
 
         # Save to file if requested
         if save_output:
-            filepath = save_to_file(summary, output_dir)
-            print(f"\nStats saved to: {filepath}", file=sys.stderr)
+            try:
+                filepath = save_to_file(summary, output_dir)
+                print(f"\nStats saved to: {filepath}", file=sys.stderr)
+            except (IOError, TypeError) as e:
+                print(f"Warning: Failed to save file: {e}", file=sys.stderr)
 
         return summary
 
+    except PlausibleRateLimitError as e:
+        print(f"Rate limit error: {e}", file=sys.stderr)
+        sys.exit(2)
     except PlausibleAPIError as e:
-        print(f"Error fetching stats: {e}", file=sys.stderr)
+        print(f"API error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -123,22 +191,38 @@ def fetch_site_stats(client: PlausibleClient, site_id: str, period: str = 'day',
             'timestamp': datetime.now().isoformat(),
             'site': site_id,
             'period': period,
-            'metrics': formatted['metrics']
+            'metrics': formatted.get('metrics', {})
         }
 
         # Output JSON
-        print(json.dumps(result, indent=2))
+        try:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except TypeError as e:
+            print(f"Error: Failed to serialize results to JSON: {e}", file=sys.stderr)
+            sys.exit(1)
 
         # Save to file if requested
         if save_output:
-            filename = f'plausible_stats_{site_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-            filepath = save_to_file(result, output_dir, filename)
-            print(f"\nStats saved to: {filepath}", file=sys.stderr)
+            try:
+                filename = f'plausible_stats_{site_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+                filepath = save_to_file(result, output_dir, filename)
+                print(f"\nStats saved to: {filepath}", file=sys.stderr)
+            except (IOError, TypeError) as e:
+                print(f"Warning: Failed to save file: {e}", file=sys.stderr)
 
         return result
 
+    except PlausibleRateLimitError as e:
+        print(f"Rate limit error: {e}", file=sys.stderr)
+        sys.exit(2)
     except PlausibleAPIError as e:
-        print(f"Error fetching stats for {site_id}: {e}", file=sys.stderr)
+        print(f"API error fetching stats for {site_id}: {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"Validation error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -155,11 +239,22 @@ def list_sites(client: PlausibleClient):
             'sites': sites
         }
 
-        print(json.dumps(result, indent=2))
+        try:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except TypeError as e:
+            print(f"Error: Failed to serialize results to JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+
         return result
 
+    except PlausibleRateLimitError as e:
+        print(f"Rate limit error: {e}", file=sys.stderr)
+        sys.exit(2)
     except PlausibleAPIError as e:
-        print(f"Error listing sites: {e}", file=sys.stderr)
+        print(f"API error listing sites: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -237,6 +332,13 @@ Period options:
     if not (args.all or args.site or args.list):
         parser.error("One of --all, --site, or --list is required")
 
+    # Validate period format (basic check)
+    valid_periods = ['day', '7d', '30d', 'month', '6mo', '12mo', 'year']
+    if args.period not in valid_periods:
+        # Check if it's a custom date range format
+        if not (args.period.endswith('d') or args.period.endswith('mo')):
+            print(f"Warning: '{args.period}' may not be a valid period. Valid options: {', '.join(valid_periods)}", file=sys.stderr)
+
     try:
         # Load configuration
         config = load_config()
@@ -256,6 +358,9 @@ Period options:
         elif args.site:
             fetch_site_stats(client, args.site, args.period, args.save, config['output_dir'])
 
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user", file=sys.stderr)
+        sys.exit(130)
     except ValueError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(1)
